@@ -62,7 +62,7 @@ export function snapshot(target: HTMLElement, stage: HTMLElement, maxLayers: num
   const walk = (el: Element, parent?: Layer, opacity = 1, clip?: DOMRect) => {
     if (layers.length >= maxLayers || ignoredTags.has(el.tagName.toUpperCase()) || el.hasAttribute('data-swarm-ignore') || el.hasAttribute('data-swarm-overlay')) return;
     const css = getComputedStyle(el);
-    if (css.display === 'none' || css.visibility === 'hidden' || css.contentVisibility === 'hidden') return;
+    if (css.display === 'none' || css.visibility === 'hidden' || css.getPropertyValue('content-visibility') === 'hidden') return;
     opacity *= Number(css.opacity);
     if (opacity < .01) return;
     const rect = el.getBoundingClientRect();

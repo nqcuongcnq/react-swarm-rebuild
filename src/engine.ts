@@ -30,7 +30,10 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
   let snapshotTaken = false;
   const audio = new SwarmAudio();
   const getState = () => ({ ...state });
-  const emit = () => { updateToolbar(); options.onStateChange?.(getState()); };
+  const emit = () => {
+    if (host) host.dataset.swarmPhase = state.phase;
+    updateToolbar(); options.onStateChange?.(getState());
+  };
   const listen = (target: EventTarget, name: string, handler: EventListener, settings?: AddEventListenerOptions) => {
     target.addEventListener(name, handler, settings);
     cleanup.push(() => target.removeEventListener(name, handler, settings));
@@ -161,7 +164,7 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
     listen(window, 'keydown', ((event: KeyboardEvent) => {
       if (event.key === 'Escape') { event.preventDefault(); stop(); }
       if ((!scoped || shadow?.activeElement) && event.key.toLowerCase() === 'm' && !event.ctrlKey && !event.metaKey && !event.altKey) setSound(!state.sound);
-      if (event.key === 'Tab' && shadow && (!scoped || shadow.activeElement)) {
+      if (event.key === 'Tab' && shadow && !scoped) {
         const buttons = Array.from(shadow.querySelectorAll<HTMLButtonElement>('button'));
         if (!buttons.length) return;
         const index = buttons.indexOf(shadow.activeElement as HTMLButtonElement);
