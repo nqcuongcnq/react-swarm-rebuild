@@ -7,7 +7,7 @@ export type { SwarmController, SwarmOptions, SwarmPhase, SwarmState } from './ty
 export interface UseSwarmRebuildResult extends SwarmController { state: SwarmState; }
 export function useSwarmRebuild(options: SwarmOptions = {}): UseSwarmRebuildResult {
   const optionsRef = useRef(options); optionsRef.current = options;
-  const settings = useRef<Pick<SwarmOptions, 'speed' | 'sound' | 'tour' | 'ready'>>({});
+  const settings = useRef<Pick<SwarmOptions, 'speed' | 'sound' | 'tour' | 'ready' | 'cursorCount'>>({});
   const instance = useRef<SwarmController | null>(null);
   const [state, setState] = useState(() => initialState(options));
   const api = useRef<SwarmController | null>(null);
@@ -34,6 +34,7 @@ export function useSwarmRebuild(options: SwarmOptions = {}): UseSwarmRebuildResu
       setSound: value => ensure().setSound(value),
       setTour: value => ensure().setTour(value),
       setReady: value => { settings.current.ready = value; instance.current?.setReady(value); },
+      setCursorCount: value => { settings.current.cursorCount = value; instance.current?.setCursorCount(value); },
       getState: () => instance.current?.getState() ?? initialState(optionsRef.current),
       destroy: () => { instance.current?.destroy(); instance.current = null; setState(initialState(optionsRef.current)); },
     };
@@ -43,6 +44,7 @@ export function useSwarmRebuild(options: SwarmOptions = {}): UseSwarmRebuildResu
   useEffect(() => { if (options.sound !== undefined) instance.current?.setSound(options.sound); }, [options.sound]);
   useEffect(() => { if (options.tour !== undefined) instance.current?.setTour(options.tour); }, [options.tour]);
   useEffect(() => { if (options.ready !== undefined) api.current?.setReady(options.ready); }, [options.ready]);
+  useEffect(() => { if (options.cursorCount !== undefined) api.current?.setCursorCount(options.cursorCount); }, [options.cursorCount]);
   return { ...api.current, state };
 }
 

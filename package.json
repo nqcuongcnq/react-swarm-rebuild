@@ -1,6 +1,6 @@
 {
   "name": "react-swarm-rebuild",
-  "version": "0.1.1",
+  "version": "0.3.0",
   "description": "A swarm of multiplayer-style cursors rebuilds your React UI with drawing, typing, guides and flocking animations.",
   "author": "Nguyễn Quốc Cường",
   "license": "MIT",

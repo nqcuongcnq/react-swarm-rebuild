@@ -1,16 +1,20 @@
 import { SwarmAudio } from './audio';
 import { backgroundColor, visibleBounds } from './bounds';
-import { clamp, ease, finite, stepSpring } from './math';
+import { clamp, finite, stepSpring } from './math';
 import { cursorMarkup, NAMES, PALETTE, styles } from './presentation';
-import { snapshot, type Layer } from './snapshot';
+import { snapshotSteps, type Layer, type Snapshot } from './snapshot';
 import type { SwarmController, SwarmOptions, SwarmPhase, SwarmState } from './types';
 
 interface Worker {
   node: HTMLDivElement; selection: HTMLDivElement; badge: HTMLSpanElement;
+  index: number; angle: number;
   x: number; y: number; vx: number; vy: number;
-  fromX: number; fromY: number; elapsed: number; duration: number;
-  task?: Layer; color: string;
+  fromX: number; fromY: number; fromVx: number; fromVy: number; elapsed: number; duration: number;
+  idleX: number; idleY: number; idleTime: number; delay: number;
+  exitX: number; exitY: number;
+  task?: Layer; pending?: Layer; color: string; retiring: boolean; bornAt: number;
 }
+const smooth = (t: number) => { const x = clamp(t, 0, 1); return x * x * (3 - 2 * x); };
 export const initialState = (options: SwarmOptions = {}): SwarmState => ({ phase: 'idle', completed: 0, total: 0, progress: 0, agents: 0, speed: finite(options.speed, 1, .25, 8), sound: options.sound ?? false, tour: options.tour ?? false });
 
 /** Create an imperative instance. Safe to import during SSR; call in the browser. */
@@ -20,7 +24,7 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
   let cover: HTMLDivElement, stage: HTMLDivElement, workersRoot: HTMLDivElement, intro: HTMLDivElement;
   let status: HTMLSpanElement, progress: HTMLDivElement, help: HTMLDivElement;
   let workers: Worker[] = [], layers: Layer[] = [];
-  let frame = 0, last = 0, elapsed = 0, lastEmit = 0, generation = 0;
+  let frame = 0, last = 0, elapsed = 0, lastEmit = 0;
   let destroyed = false, active = false, previousFocus: HTMLElement | null = null;
   let savedPhase: SwarmPhase = 'building';
   let pointer = { x: 0, y: 0 }, cleanup: (() => void)[] = [];
@@ -28,6 +32,9 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
   let target: HTMLElement, scoped = false, ready = options.ready !== false;
   let bounds: DOMRect, capturedBounds: DOMRect | undefined;
   let snapshotTaken = false;
+  let captureSteps: Generator<void, Snapshot> | undefined;
+  let motionTime = 0, entranceTime = 0, transitionTime = 0, exitTime = 0;
+  let desiredCount = Math.floor(finite(options.cursorCount, 16, 2, 48)), nextWorkerId = 0;
   const audio = new SwarmAudio();
   const getState = () => ({ ...state });
   const emit = () => {
@@ -44,7 +51,7 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
   function setPhase(phase: SwarmPhase) { state.phase = phase; emit(); }
   function updateToolbar() {
     if (!shadow) return;
-    if (status) status.textContent = state.phase === 'scanning' ? 'Scanning page…' : state.phase === 'intro' ? ready ? 'Gathering the swarm…' : 'Preparing content…' : state.phase === 'complete' ? 'Built. Move your mouse.' : `${state.completed} / ${state.total} layers`;
+    if (status) status.textContent = state.phase === 'scanning' ? 'Scanning page…' : state.phase === 'intro' ? ready ? 'Gathering the swarm…' : 'Preparing content…' : state.phase === 'transition' ? 'Preparing the canvas…' : state.phase === 'exiting' ? 'Ready.' : state.phase === 'complete' ? 'Built.' : `${state.completed} / ${state.total} layers`;
     if (progress) progress.style.width = `${state.progress * 100}%`;
     const update = (action: string, text: string, pressed?: boolean) => {
       const button = shadow!.querySelector<HTMLButtonElement>(`[data-action="${action}"]`);
@@ -59,7 +66,7 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
   function dispose() {
     const restoreFocus = !!shadow?.activeElement;
     active = false;
-    generation++;
+    captureSteps?.return(undefined as never); captureSteps = undefined;
     if (frame) window.cancelAnimationFrame(frame);
     frame = 0;
     cleanup.splice(0).forEach(fn => fn());
@@ -79,19 +86,26 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
   function setSpeed(speed: number) { state.speed = finite(speed, state.speed, .25, 8); emit(); }
   function setSound(enabled: boolean) { state.sound = enabled; audio.setEnabled(enabled && active); emit(); }
   function setTour(enabled: boolean) { state.tour = enabled; emit(); }
-  function setReady(value: boolean) { ready = value; }
+  function setReady(value: boolean) {
+    ready = value;
+    if (!value && captureSteps) {
+      captureSteps.return(undefined as never); captureSteps = undefined;
+      capturedBounds = undefined;
+      // Drop partial geometry if data became pending again before handoff.
+      for (const node of Array.from(stage.children)) {
+        if (!node.classList.contains('selection')) node.remove();
+      }
+    }
+  }
   function toolbar() {
-    if (options.controls === false) return;
+    if (!options.controls) return;
     const minimal = options.controls === 'minimal';
     const bar = element('div', minimal ? 'toolbar minimal' : 'toolbar', shadow);
     bar.setAttribute('role', 'toolbar'); bar.setAttribute('aria-label', 'Swarm rebuild controls');
     if (minimal) {
+      bar.style.pointerEvents = 'none';
       status = element('span', 'status', bar);
       status.setAttribute('role', 'status');
-      const skip = element('button', 'live', bar);
-      skip.type = 'button'; skip.textContent = 'Skip animation';
-      skip.setAttribute('aria-label', 'Skip animation');
-      listen(skip, 'click', goLive);
       return;
     }
     const avatars = element('div', 'avatars', bar);
@@ -137,7 +151,8 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
     scoped = options.scope === 'target' || (options.scope !== 'viewport' && target !== document.body && target !== document.documentElement);
     viewportWidth = window.innerWidth; viewportHeight = window.innerHeight;
     bounds = scoped ? visibleBounds(target) : new DOMRect(0, 0, viewportWidth, viewportHeight);
-    capturedBounds = undefined; snapshotTaken = false;
+    capturedBounds = undefined; snapshotTaken = false; captureSteps = undefined;
+    motionTime = 0; entranceTime = 0; transitionTime = 0; exitTime = 0;
     pointer = { x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height * .46 };
     previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     host = document.createElement('div');
@@ -172,7 +187,22 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
         buttons[(index + (event.shiftKey ? -1 : 1) + buttons.length) % buttons.length].focus();
       }
     }) as EventListener);
-    listen(cover, 'pointerdown', () => { if (state.sound) audio.setEnabled(true); });
+    if (options.clickToSkip !== false) {
+      cover.style.cursor = 'pointer';
+      cover.tabIndex = 0;
+      cover.setAttribute('role', 'button');
+      cover.setAttribute('aria-label', 'Skip animation');
+      listen(cover, 'click', event => {
+        // Remove on click, not pointerdown, so the released click cannot
+        // activate a link/button in the real application underneath.
+        event.preventDefault(); event.stopPropagation(); goLive();
+      });
+      listen(cover, 'keydown', ((event: KeyboardEvent) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault(); event.stopPropagation(); goLive();
+        }
+      }) as EventListener);
+    }
     // A fresh snapshot after layout changes avoids stale geometry. Ignore mobile browser chrome height changes.
     listen(window, 'resize', () => {
       if (Math.abs(window.innerWidth - viewportWidth) > 2) { if (scoped) goLive(); else start(); }
@@ -183,7 +213,7 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
     if (scoped) {
       // Once geometry is captured, scrolling reveals the real UI instead of
       // animating stale positions or blocking the surrounding application.
-      listen(document, 'scroll', () => { if (snapshotTaken) goLive(); }, { capture: true, passive: true });
+      listen(document, 'scroll', () => { if (snapshotTaken || captureSteps) goLive(); }, { capture: true, passive: true });
     }
     createWorkers();
     setPhase('intro');
@@ -203,62 +233,136 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
       host.style.setProperty('--swarm-bottom', `${window.innerHeight - bounds.bottom + 16}px`);
     }
   }
-  function capture() {
+  function prepareSnapshot() {
+    if (!captureSteps) {
+      capturedBounds = bounds;
+      captureSteps = snapshotSteps(target, stage, finite(options.maxLayers, 2500, 1, 10000), scoped ? bounds : undefined);
+    }
+    const deadline = performance.now() + finite(options.snapshotBudget, 4, 1, 12);
     try {
-      const result = snapshot(target, stage, finite(options.maxLayers, 2500, 1, 10000), scoped ? bounds : undefined);
-      layers = result.layers;
-      state.total = layers.length;
-      snapshotTaken = true; capturedBounds = bounds;
-      // Selection outlines must sit above the reconstructed content.
-      workers.forEach(worker => stage.append(worker.selection));
-      intro.style.opacity = '0';
-      const guidePositions = [...new Set(layers.filter(l => l.kind === 'text').map(l => Math.round(l.x)))].slice(0, 5);
-      guidePositions.forEach(x => { const guide = element('div', 'guide', shadow); guide.style.left = `${x - window.scrollX}px`; });
-      setPhase('building');
+      do {
+        const next = captureSteps.next();
+        if (!next.done) continue;
+        layers = next.value.layers;
+        state.total = layers.length;
+        snapshotTaken = true; captureSteps = undefined;
+        workers.forEach(worker => {
+          stage.append(worker.selection);
+          worker.fromX = worker.x; worker.fromY = worker.y;
+          worker.idleX = worker.x; worker.idleY = worker.y; worker.idleTime = 0;
+          worker.delay = options.smoothTransition === false ? 0 : worker.index * .025;
+        });
+        if (options.showGuides === true) {
+          const positions = [...new Set(layers.filter(layer => layer.kind === 'text').map(layer => Math.round(layer.x)))].slice(0, 5);
+          positions.forEach(x => { const guide = element('div', 'guide', shadow); guide.style.left = `${x - window.scrollX}px`; });
+        }
+        intro.style.transition = options.smoothTransition === false ? 'none' : '';
+        transitionTime = 0;
+        setPhase(options.smoothTransition === false ? 'building' : 'transition');
+        return;
+      } while (performance.now() < deadline);
     } catch (error) {
       stop(); options.onError?.(error as Error);
       if (!options.onError) console.error('[react-swarm-rebuild]', error);
     }
   }
-  function createWorkers() {
-    const count = Math.floor(finite(options.cursorCount, 16, 2, 48));
+  function makeWorker(index: number, count: number): Worker {
     const colors = options.colors?.length ? options.colors : PALETTE;
     const names = options.names?.length ? options.names : NAMES;
-    workers = Array.from({ length: count }, (_, i) => {
-      const color = colors[i % colors.length];
-      const node = element('div', 'worker', workersRoot);
-      node.style.setProperty('--color', color);
-      node.innerHTML = cursorMarkup(color);
-      if (options.showNames === true) { const name = element('span', 'name', node); name.textContent = names[i % names.length]; }
-      const selection = element('div', 'selection', stage);
-      selection.style.setProperty('--color', color); selection.hidden = true;
-      const badge = element('span', 'badge', selection);
-      const angle = i / count * Math.PI * 2;
-      return { node, selection, badge, color, x: bounds.left + bounds.width / 2 + Math.cos(angle) * Math.min(100, bounds.width * .25), y: bounds.top + bounds.height * .46 + Math.sin(angle) * Math.min(100, bounds.height * .25), vx: 0, vy: 0, fromX: 0, fromY: 0, elapsed: 0, duration: 1 };
+    const color = colors[index % colors.length];
+    const node = element('div', 'worker', workersRoot);
+    node.style.setProperty('--color', color);
+    node.innerHTML = cursorMarkup(color);
+    if (options.showNames === true) { const name = element('span', 'name', node); name.textContent = names[index % names.length]; }
+    const selection = element('div', 'selection', stage);
+    selection.style.setProperty('--color', color); selection.hidden = true;
+    const badge = element('span', 'badge', selection);
+    const angle = index / count * Math.PI * 2;
+    const x = bounds.left + bounds.width / 2 + Math.cos(angle) * Math.min(100, bounds.width * .25);
+    const y = bounds.top + bounds.height * .46 + Math.sin(angle) * Math.min(70, bounds.height * .2);
+    node.style.transform = `translate3d(${x}px,${y}px,0)`;
+    node.dataset.motion = 'orbit';
+    return { node, selection, badge, index, color, x, y, angle: 0, vx: 0, vy: 0,
+      fromX: x, fromY: y, fromVx: 0, fromVy: 0, idleX: x, idleY: y, idleTime: 0, delay: 0,
+      exitX: x, exitY: y, elapsed: 0, duration: 1, retiring: false, bornAt: -Infinity };
+  }
+  function setCursorCount(count: number) {
+    if (destroyed) return;
+    desiredCount = Math.floor(finite(count, desiredCount, 2, 48));
+    if (!active || state.phase === 'exiting' || (state.phase === 'paused' && savedPhase === 'exiting')) return;
+    workers.forEach(worker => { worker.retiring = false; });
+    while (workers.length > desiredCount) {
+      const free = [...workers].reverse().find(worker => !worker.task);
+      if (!free) break;
+      free.node.remove(); free.selection.remove();
+      workers = workers.filter(worker => worker !== free);
+    }
+    const surplus = Math.max(0, workers.length - desiredCount);
+    if (surplus > 0) workers.slice(-surplus).forEach(worker => { worker.retiring = true; worker.pending = undefined; });
+    while (workers.length < desiredCount) {
+      const worker = makeWorker(nextWorkerId++, desiredCount);
+      worker.bornAt = motionTime; worker.node.style.opacity = '0';
+      workers.push(worker);
+    }
+    state.agents = workers.length; emit();
+  }
+  function retireWorkers() {
+    const previous = workers.length;
+    workers = workers.filter(worker => {
+      if (!worker.retiring || worker.task) return true;
+      worker.node.remove(); worker.selection.remove(); return false;
     });
-    state.agents = count;
-    const ruler = element('div', 'ruler-x', shadow); ruler.textContent = '　 0　　　　 100　　　　 200　　　　 300　　　　 400　　　　 500　　　　 600　　　　 700　　　　 800　　　　 900';
-    element('div', 'ruler-y', shadow);
+    if (previous !== workers.length) { state.agents = workers.length; emit(); }
+  }
+  function createWorkers() {
+    nextWorkerId = 0;
+    workers = Array.from({ length: desiredCount }, () => makeWorker(nextWorkerId++, desiredCount));
+    state.agents = workers.length;
+    if (options.showRulers === true) {
+      const ruler = element('div', 'ruler-x', shadow);
+      ruler.textContent = '　 0　　　　 100　　　　 200　　　　 300　　　　 400　　　　 500　　　　 600　　　　 700　　　　 800　　　　 900';
+      element('div', 'ruler-y', shadow);
+    }
+    const opacity = options.fadeIn === false ? '1' : '0';
+    workersRoot.style.opacity = opacity; intro.style.opacity = opacity;
+    const bar = shadow?.querySelector<HTMLElement>('.toolbar');
+    if (bar) bar.style.opacity = opacity;
+  }
+  function dependenciesReady(layer: Layer) {
+    if (options.parallelDrawing === false) return (!layer.parent || layer.parent.done) && (!layer.master || layer.master.done);
+    // DOM order already fixes visual stacking. Begin details while their
+    // backdrop is drawing rather than serializing every nested surface.
+    return (!layer.parent || layer.parent.done || layer.parent.progress >= .15) &&
+      (!layer.master || layer.master.done || layer.master.progress >= .35);
+  }
+  function choosePending(worker: Worker) {
+    if (worker.pending && !worker.pending.started && !worker.pending.done) return;
+    const claimed = new Set(workers.filter(other => other !== worker).map(other => other.pending));
+    const next = layers.find(layer => !layer.started && !layer.done && !claimed.has(layer));
+    if (next !== worker.pending) { worker.pending = next; worker.idleTime = 0; }
   }
   function assign(worker: Worker) {
     const top = window.scrollY, bottom = top + viewportHeight;
     let best: Layer | undefined, score = Infinity;
     for (const layer of layers) {
-      if (layer.done || layer.started || (layer.parent && !layer.parent.done) || (layer.master && !layer.master.done)) continue;
+      if (layer.done || layer.started || !dependenciesReady(layer)) continue;
       if (layer.y > bottom + 80) continue;
-      const priority = Math.max(0, layer.y - top) * .8 + Math.hypot(layer.x - window.scrollX - worker.x, layer.y - top - worker.y) * .2;
+      const priority = Math.max(0, layer.y - top) * .8 + Math.hypot(layer.x - window.scrollX - worker.x, layer.y - top - worker.y) * .2 - (worker.pending === layer ? 150 : 0);
       if (priority < score) { best = layer; score = priority; }
     }
-    if (!best) return;
+    if (!best) { choosePending(worker); return; }
+    worker.pending = undefined;
     best.started = true; worker.task = best; worker.elapsed = 0;
     worker.fromX = worker.x; worker.fromY = worker.y;
-    const textLength = best.text?.reduce((n, run) => n + run.value.length, 0) ?? 0;
-    worker.duration = best.kind === 'text' ? clamp(textLength * .018, .45, 2.4) : .5 + Math.min(1, (best.width + best.height) / 1000);
-    worker.node.dataset.tool = best.master ? 'duplicate' : 'arrow';
-    const arrow = worker.node.querySelector<SVGElement>('.pointer');
-    if (arrow) arrow.style.transform = '';
+    worker.fromVx = worker.vx; worker.fromVy = worker.vy;
+    const count = best.text?.reduce((sum, run) => sum + run.units.length, 0) ?? 0;
+    worker.duration = best.kind === 'text'
+      ? clamp(count / finite(options.typingSpeed, 45, 5, 300), .35, 8)
+      : .5 + Math.min(1, (best.width + best.height) / 1000);
+    worker.node.dataset.motion = 'working';
+    worker.node.dataset.tool = 'arrow';
     worker.selection.style.borderStyle = best.master ? 'dashed' : 'solid';
-    if (best.master) {
+    if (best.master && options.showGuides === true) {
       const measure = element('span', 'measure', worker.selection);
       measure.textContent = `⌥ ${Math.round(Math.hypot(best.x - best.master.x, best.y - best.master.y))}`;
     }
@@ -266,54 +370,64 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
   function work(worker: Worker, dt: number) {
     const task = worker.task!;
     worker.elapsed += dt;
-    const travel = .5;
+    const travel = .55;
     const x = task.x - window.scrollX, y = task.y - window.scrollY;
+    const first = task.text?.[0]?.units[0];
+    const startX = first && options.typing !== false ? first.startX - window.scrollX : task.master ? task.master.x - window.scrollX : x;
+    const startY = first && options.typing !== false ? first.y - window.scrollY : task.master ? task.master.y - window.scrollY : y;
     if (worker.elapsed < travel) {
-      const t = ease(worker.elapsed / travel);
-      const sourceX = task.master ? task.master.x - window.scrollX : x;
-      const sourceY = task.master ? task.master.y - window.scrollY : y;
-      worker.x = worker.fromX + (sourceX - worker.fromX) * t;
-      worker.y = worker.fromY + (sourceY - worker.fromY) * t;
+      const t = clamp(worker.elapsed / travel, 0, 1), blend = smooth(t);
+      // Hermite travel retains the drift velocity at departure and arrives
+      // at rest, instead of snapping from the orbit to an unrelated easing.
+      const tangent = t * (1 - t) * (1 - t) * travel / state.speed;
+      worker.x = worker.fromX + (startX - worker.fromX) * blend + worker.fromVx * tangent;
+      worker.y = worker.fromY + (startY - worker.fromY) * blend + worker.fromVy * tangent;
       return;
     }
     const t = clamp((worker.elapsed - travel) / worker.duration, 0, 1);
-    const draw = ease(Math.min(1, t / .35));
-    worker.node.dataset.tool = task.master ? 'duplicate' : task.kind === 'text' && t > .35 ? 'type' : task.kind === 'line' ? 'pen' : 'cross';
-    worker.selection.hidden = false;
-    const width = task.kind === 'text' ? task.width * draw : task.width * ease(t);
-    const height = task.kind === 'text' ? task.height * draw : task.height * ease(t);
-    const duplicateX = task.master ? (task.master.x - task.x) * (1 - ease(t)) : 0;
-    const duplicateY = task.master ? (task.master.y - task.y) * (1 - ease(t)) : 0;
-    worker.selection.style.left = `${task.x + duplicateX}px`; worker.selection.style.top = `${task.y + duplicateY}px`;
-    worker.selection.style.width = `${Math.max(1, task.master ? task.width : width)}px`; worker.selection.style.height = `${Math.max(1, task.master ? task.height : height)}px`;
-    worker.selection.style.background = task.kind === 'box' && !task.master && t < .65 ? '#a0a5ab18' : '';
-    worker.badge.textContent = `${Math.round(width)} × ${Math.round(height)}`;
-    worker.x = x + width; worker.y = y + height;
+    const draw = smooth(t);
+    task.progress = t;
+    task.element.dataset.swarmProgress = String(t);
+    const width = task.width * draw, height = task.height * draw;
+    const duplicateX = task.master ? (task.master.x - task.x) * (1 - draw) : 0;
+    const duplicateY = task.master ? (task.master.y - task.y) * (1 - draw) : 0;
+    task.element.style.opacity = '1';
     task.element.style.visibility = 'visible';
     task.element.style.transform = task.master ? `translate(${duplicateX}px,${duplicateY}px)` : '';
-    if (task.master) { worker.x = x + duplicateX; worker.y = y + duplicateY; }
     if (task.text) {
-      const total = task.text.reduce((n, run) => n + run.value.length, 0);
-      let remaining = Math.ceil(total * clamp((t - .35) / .65, 0, 1));
-      task.text.forEach(run => {
-        const value = run.value.slice(0, Math.max(0, remaining));
-        if (run.node.textContent !== value) audio.play('type', worker.x / viewportWidth);
-        run.node.textContent = value; remaining -= run.value.length;
-      });
-      worker.x = x + task.width * (total ? clamp((t - .35) / .65, 0, 1) : 1);
-      worker.y = y + task.height * .5;
-      // A visible insertion caret follows the typing cursor.
-      worker.badge.textContent = 'T';
-      const fontSize = parseFloat(task.text[0]?.node.style.fontSize ?? '0');
-      if (fontSize >= 32) {
-        const scale = Math.min(1, (18 + Math.floor(t * 5) / 5 * (fontSize - 18)) / fontSize);
-        (task.element.firstElementChild as HTMLElement).style.transformOrigin = 'top left';
-        (task.element.firstElementChild as HTMLElement).style.transform = `scale(${scale})`;
+      worker.selection.hidden = true;
+      const typing = options.typing !== false;
+      worker.node.dataset.tool = typing ? 'type' : 'arrow';
+      const count = task.text.reduce((sum, run) => sum + run.units.length, 0);
+      let remaining = typing ? Math.floor(count * t) : count;
+      let caret = first;
+      let typed = false;
+      for (const run of task.text) {
+        const shown = Math.min(run.units.length, Math.max(0, remaining));
+        const value = run.value.slice(0, shown ? run.units[shown - 1].end : 0);
+        if (run.node.textContent !== value) { run.node.textContent = value; typed = true; }
+        if (shown) caret = run.units[shown - 1];
+        remaining -= run.units.length;
+        run.node.style.opacity = typing ? run.opacity : String(Number(run.opacity || 1) * smooth(t));
       }
+      const anyTyped = !typing || Math.floor(count * t) > 0;
+      worker.x = caret ? (anyTyped ? caret.x : caret.startX) - window.scrollX : x;
+      worker.y = caret ? caret.y - window.scrollY : y;
+      worker.node.style.setProperty('--caret-height', `${clamp(caret?.height ?? task.height, 12, 80)}px`);
+      if (typing && typed) audio.play('type', worker.x / viewportWidth);
     } else {
+      worker.node.dataset.tool = task.master ? 'duplicate' : task.kind === 'line' ? 'pen' : 'cross';
+      worker.selection.hidden = false;
+      worker.selection.style.left = `${task.x + duplicateX}px`; worker.selection.style.top = `${task.y + duplicateY}px`;
+      worker.selection.style.width = `${Math.max(1, task.master ? task.width : width)}px`;
+      worker.selection.style.height = `${Math.max(1, task.master ? task.height : height)}px`;
+      worker.selection.style.background = task.kind === 'box' && !task.master && t < .65 ? '#a0a5ab18' : '';
+      worker.badge.textContent = `${Math.round(width)} × ${Math.round(height)}`;
+      worker.x = task.master ? x + duplicateX : x + width;
+      worker.y = task.master ? y + duplicateY : y + height;
       const visual = task.element.firstElementChild as HTMLElement;
-      visual.style.clipPath = task.master ? '' : task.kind === 'media' ? `inset(0 0 ${100 - ease(t) * 100}% 0)` : `inset(0 ${100 - ease(t) * 100}% 0 0)`;
-      visual.style.opacity = String(Number(task.opacity || 1) * (.3 + .7 * ease(t)));
+      visual.style.clipPath = task.master ? '' : task.kind === 'media' ? `inset(0 0 ${100 - draw * 100}% 0)` : `inset(0 ${100 - draw * 100}% 0 0)`;
+      visual.style.opacity = String(Number(task.opacity || 1) * (.3 + .7 * draw));
     }
     if (t > .02 && t < .08) audio.play('draw', worker.x / viewportWidth);
     if (t >= 1) {
@@ -321,28 +435,76 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
       const visual = task.element.firstElementChild as HTMLElement;
       visual.style.clipPath = ''; visual.style.opacity = task.opacity; visual.style.transform = '';
       task.element.style.transform = '';
-      worker.selection.hidden = true;
-      worker.selection.querySelector('.measure')?.remove();
-      worker.node.dataset.tool = 'arrow';
-      worker.task = undefined;
+      worker.selection.hidden = true; worker.selection.querySelector('.measure')?.remove();
+      worker.node.dataset.tool = 'arrow'; worker.node.dataset.motion = 'idle';
+      worker.task = undefined; worker.vx = 0; worker.vy = 0;
+      worker.idleX = worker.x; worker.idleY = worker.y; worker.idleTime = 0;
+      worker.delay = options.smoothTransition === false ? 0 : .08 + (worker.index % 5) * .025;
       state.completed++; state.progress = state.total ? state.completed / state.total : 1;
     }
   }
-  function flock(worker: Worker, index: number, dt: number, orbit: boolean) {
-    const theta = index / workers.length * Math.PI * 2 + elapsed * (orbit ? 1.3 : .28);
-    const radius = Math.min(orbit ? 100 + Math.sin(index * 2 + elapsed) * 15 : 55 + (index % 4) * 23, bounds.width * .3, bounds.height * .3);
-    let tx = (orbit ? bounds.left + bounds.width / 2 : pointer.x) + Math.cos(theta) * radius;
-    let ty = (orbit ? bounds.top + bounds.height * .46 : pointer.y) + Math.sin(theta) * radius * .7;
-    for (const other of workers) {
-      if (other === worker) continue;
-      const dx = worker.x - other.x, dy = worker.y - other.y, d2 = dx * dx + dy * dy;
-      if (d2 > 0 && d2 < 900) { tx += dx * 500 / d2; ty += dy * 500 / d2; }
+  function float(worker: Worker, dt: number, orbit: boolean) {
+    const phase = worker.index * 2.399963;
+    const rate = finite(options.floatSpeed, 1, .25, 3), amplitude = finite(options.floatAmplitude, 1, .25, 3);
+    const time = motionTime * rate;
+    let tx: number, ty: number;
+    if (orbit) {
+      const buoyant = options.floatingIntro !== false;
+      const theta = worker.index / workers.length * Math.PI * 2 + time * .8;
+      const breathe = buoyant ? Math.sin(time * 1.45 + phase) * 24 * amplitude : 0;
+      const radius = Math.min(105 + breathe, bounds.width * .31, bounds.height * .31);
+      tx = bounds.left + bounds.width / 2 + Math.cos(theta) * radius + (buoyant ? Math.sin(time * 1.35 + phase) * 18 * amplitude : 0);
+      ty = bounds.top + bounds.height * .46 + Math.sin(theta) * radius * .7 + (buoyant ? Math.sin(time * 1.9 + phase) * 26 * amplitude : 0);
+    } else if (options.floatingIdle !== false) {
+      worker.idleTime += dt;
+      const settle = smooth(worker.idleTime / .35);
+      if (worker.pending && !worker.pending.started && !worker.pending.done) {
+        const nextX = clamp(worker.pending.x - window.scrollX + worker.pending.width * .5, bounds.left + 25, Math.max(bounds.left + 25, bounds.right - 35));
+        const nextY = clamp(worker.pending.y - window.scrollY + Math.min(worker.pending.height * .5, 80), bounds.top + 35, Math.max(bounds.top + 35, bounds.bottom - 45));
+        const reposition = 1 - Math.exp(-2.8 * dt);
+        worker.idleX += (nextX - worker.idleX) * reposition;
+        worker.idleY += (nextY - worker.idleY) * reposition;
+      }
+      tx = worker.idleX + (Math.sin(time * 1.5 + phase) * 55 + Math.sin(time * 2.3 + phase * .7) * 14) * amplitude * settle;
+      ty = worker.idleY + (Math.cos(time * 1.85 + phase) * 38 + Math.sin(time * 2.7 + phase * 1.3) * 10) * amplitude * settle;
+    } else {
+      const theta = worker.index / workers.length * Math.PI * 2 + time * .28;
+      const radius = 55 + (worker.index % 4) * 23;
+      tx = pointer.x + Math.cos(theta) * radius; ty = pointer.y + Math.sin(theta) * radius * .7;
     }
-    const sx = stepSpring(worker.x, worker.vx, clamp(tx, bounds.left + 15, Math.max(bounds.left + 15, bounds.right - 25)), dt);
-    const sy = stepSpring(worker.y, worker.vy, clamp(ty, bounds.top + 25, Math.max(bounds.top + 25, bounds.bottom - 60)), dt);
+    // The waiting motion has more energy but remains damped and continuous.
+    const respond = (position: number, velocity: number, destination: number) => {
+      const nextVelocity = (velocity + (destination - position) * 38 * dt) * Math.exp(-8 * dt);
+      return { position: position + nextVelocity * dt, velocity: nextVelocity };
+    };
+    const sx = respond(worker.x, worker.vx, clamp(tx, bounds.left + 15, Math.max(bounds.left + 15, bounds.right - 25)));
+    const sy = respond(worker.y, worker.vy, clamp(ty, bounds.top + 25, Math.max(bounds.top + 25, bounds.bottom - 35)));
     worker.x = sx.position; worker.vx = sx.velocity; worker.y = sy.position; worker.vy = sy.velocity;
+    worker.node.dataset.motion = orbit ? 'orbit' : worker.pending && !worker.pending.started ? 'staging' : 'idle';
+    const tilt = Math.sin(time * 1.5 + phase) * 23;
+    worker.angle += (tilt - worker.angle) * (1 - Math.exp(-7 * dt));
+  }
+  function beginExit() {
+    if (options.burstOnComplete === false || finite(options.exitDuration, 700, 0, 3000) === 0) { goLive(); return; }
+    const centerX = bounds.left + bounds.width / 2, centerY = bounds.top + bounds.height / 2;
+    const ordered = [...workers].sort((a, b) => Math.atan2(a.y - centerY, a.x - centerX) - Math.atan2(b.y - centerY, b.x - centerX));
+    const distance = Math.hypot(bounds.width, bounds.height) + 100;
+    ordered.forEach((worker, index) => {
+      // Spread directions evenly without collecting cursors at the center.
+      const angle = -Math.PI + (index + .5) / workers.length * Math.PI * 2;
+      worker.fromX = worker.x; worker.fromY = worker.y;
+      worker.exitX = worker.x + Math.cos(angle) * distance;
+      worker.exitY = worker.y + Math.sin(angle) * distance;
+      worker.node.dataset.tool = 'arrow'; worker.node.dataset.motion = 'exit';
+      worker.selection.hidden = true;
+    });
+    exitTime = 0; setPhase('exiting');
+  }
+  function drawWorker(worker: Worker) {
+    if (state.phase !== 'exiting' && Number.isFinite(worker.bornAt)) worker.node.style.opacity = String(smooth((motionTime - worker.bornAt) / .25));
+    worker.node.style.transform = `translate3d(${worker.x.toFixed(2)}px,${worker.y.toFixed(2)}px,0)`;
     const arrow = worker.node.querySelector<SVGElement>('.pointer');
-    if (arrow) { arrow.style.transformOrigin = '3px 2.5px'; arrow.style.transform = `translate(-3px,-2.5px) rotate(${Math.atan2(worker.vy, worker.vx) * 180 / Math.PI + 135}deg)`; }
+    if (arrow) arrow.style.transform = `translate(-3px,-2.5px) rotate(${worker.angle.toFixed(2)}deg)`;
   }
   function tick(now: number) {
     if (!active) return;
@@ -355,21 +517,47 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
     const realDt = Math.min(.05, Math.max(0, (now - last) / 1000)); last = now;
     stage.style.transform = `translate(${-window.scrollX}px,${-window.scrollY}px)`;
     if (state.phase !== 'paused') {
-      const dt = realDt * state.speed; elapsed += dt;
-      if (state.phase === 'intro' && ready && elapsed * 1000 >= finite(options.introDuration, 1600, 0, 15000)) {
-        capture();
+      const dt = realDt * state.speed;
+      elapsed += dt; motionTime += realDt; entranceTime += realDt;
+      const entrance = options.fadeIn === false ? 1 : smooth(entranceTime * 1000 / Math.max(1, finite(options.fadeInDuration, 360, 0, 3000)));
+      workersRoot.style.opacity = String(entrance);
+      const bar = shadow?.querySelector<HTMLElement>('.toolbar');
+      if (bar) bar.style.opacity = String(entrance);
+      if (state.phase === 'intro') {
+        intro.style.opacity = String(entrance);
+        workers.forEach(worker => float(worker, realDt, true));
+        if (ready && elapsed * 1000 >= finite(options.introDuration, 1600, 0, 15000)) prepareSnapshot();
         if (!active) return;
-      }
-      workers.forEach((worker, index) => {
-        if (state.phase === 'building') {
-          if (!worker.task) assign(worker);
-          if (worker.task) work(worker, dt); else flock(worker, index, realDt, false);
-        } else flock(worker, index, realDt, state.phase === 'intro');
-        worker.node.style.transform = `translate3d(${worker.x.toFixed(2)}px,${worker.y.toFixed(2)}px,0)`;
-      });
-      if (state.phase === 'building') {
-        if (state.tour) {
-          const next = layers.filter(l => !l.done).reduce((min, l) => Math.min(min, l.y), Infinity);
+      } else if (state.phase === 'transition') {
+        transitionTime += realDt;
+        const t = smooth(transitionTime * 1000 / Math.max(1, finite(options.transitionDuration, 480, 0, 3000)));
+        intro.style.opacity = String(1 - t);
+        workers.forEach(worker => {
+          // Brake the existing orbit with the same spring, keeping velocity
+          // continuous while workers settle into independent waiting spots.
+          const phase = worker.index * 2.399963;
+          const sx = stepSpring(worker.x, worker.vx, worker.fromX + Math.sin(phase) * 18 * t, realDt);
+          const sy = stepSpring(worker.y, worker.vy, worker.fromY + Math.cos(phase) * 14 * t, realDt);
+          worker.x = sx.position; worker.vx = sx.velocity;
+          worker.y = sy.position; worker.vy = sy.velocity;
+          worker.node.dataset.motion = 'handoff';
+          worker.idleX = worker.x; worker.idleY = worker.y;
+        });
+        if (t >= 1) { intro.style.opacity = '0'; setPhase('building'); }
+      } else if (state.phase === 'building') {
+        intro.style.opacity = '0';
+        workers.forEach(worker => {
+          worker.delay = Math.max(0, worker.delay - realDt);
+          if (worker.retiring && !worker.task) return;
+          if (!worker.retiring && !worker.task && worker.delay <= 0) assign(worker);
+          if (worker.task) {
+            worker.angle *= Math.exp(-8 * realDt);
+            work(worker, dt);
+          } else float(worker, realDt, false);
+        });
+        retireWorkers();
+        if (state.tour && !scoped) {
+          const next = layers.filter(layer => !layer.done).reduce((min, layer) => Math.min(min, layer.y), Infinity);
           if (Number.isFinite(next)) {
             const goal = Math.max(0, next - viewportHeight * .35);
             if (goal > window.scrollY + 1) window.scrollBy(0, Math.min(goal - window.scrollY, 180 * dt));
@@ -378,12 +566,29 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
         if (state.completed === state.total) {
           state.progress = 1; shadow?.querySelectorAll('.guide,.ruler-x,.ruler-y').forEach(node => node.remove());
           audio.play('complete'); setPhase('complete'); options.onComplete?.();
-          if (options.finishBehavior !== 'flock') { goLive(); return; }
+          if (!active) return;
+          if (options.finishBehavior !== 'flock') beginExit();
+          if (!active) return;
         }
+      } else if (state.phase === 'exiting') {
+        exitTime += realDt;
+        const t = clamp(exitTime * 1000 / Math.max(1, finite(options.exitDuration, 700, 0, 3000)), 0, 1);
+        const accelerate = t * t;
+        workers.forEach(worker => {
+          worker.x = worker.fromX + (worker.exitX - worker.fromX) * accelerate;
+          worker.y = worker.fromY + (worker.exitY - worker.fromY) * accelerate;
+          worker.node.style.opacity = String(1 - smooth((t - .45) / .55));
+        });
+        cover.style.opacity = String(1 - smooth((t - .45) / .55));
+        if (bar) bar.style.opacity = String(1 - smooth(t));
+        if (t >= 1) { goLive(); return; }
+      } else if (state.phase === 'complete') {
+        workers.forEach(worker => float(worker, realDt, false));
       }
+      workers.forEach(drawWorker);
       if (now - lastEmit > 150) { lastEmit = now; emit(); }
     }
     if (active) frame = window.requestAnimationFrame(tick);
   }
-  return { start, replay: start, pause, resume, goLive, stop, setSpeed, setSound, setTour, setReady, getState, destroy() { dispose(); audio.destroy(); destroyed = true; state = { ...state, phase: 'idle', agents: 0 }; } };
+  return { start, replay: start, pause, resume, goLive, stop, setSpeed, setSound, setTour, setReady, setCursorCount, getState, destroy() { dispose(); audio.destroy(); destroyed = true; state = { ...state, phase: 'idle', agents: 0 }; } };
 }

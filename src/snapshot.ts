@@ -1,14 +1,22 @@
+export interface TextUnit {
+  end: number;
+  startX: number; x: number; y: number; height: number;
+}
+export interface TextRun {
+  node: HTMLElement; value: string; opacity: string; units: TextUnit[];
+}
 export interface Layer {
   id: number;
   kind: 'box' | 'text' | 'media' | 'line';
   x: number; y: number; width: number; height: number;
   element: HTMLElement;
-  text?: { node: HTMLElement; value: string }[];
+  text?: TextRun[];
   signature: string;
   master?: Layer;
   parent?: Layer;
   done: boolean;
   started: boolean;
+  progress: number;
   opacity: string;
 }
 export interface Snapshot { layers: Layer[]; background: string; }
@@ -34,7 +42,7 @@ function copyStyles(from: Element, to: Element) {
 }
 
 /** A flat visual display list. The application DOM is read, never rewritten. */
-export function snapshot(target: HTMLElement, stage: HTMLElement, maxLayers: number, viewport?: DOMRect): Snapshot {
+export function* snapshotSteps(target: HTMLElement, stage: HTMLElement, maxLayers: number, viewport?: DOMRect): Generator<void, Snapshot> {
   const layers: Layer[] = [];
   const masters = new Map<string, Layer>();
   const scrollX = window.scrollX, scrollY = window.scrollY;
@@ -46,11 +54,14 @@ export function snapshot(target: HTMLElement, stage: HTMLElement, maxLayers: num
     (rect.bottom > clip.top && rect.top < clip.bottom && rect.right > clip.left && rect.left < clip.right);
   const add = (kind: Layer['kind'], rect: DOMRect, visual: HTMLElement, parent?: Layer, signature = '') => {
     const element = document.createElement('div');
+    element.dataset.swarmKind = kind;
     const x = rect.left + scrollX, y = rect.top + scrollY;
-    element.style.cssText = `position:absolute;left:${x}px;top:${y}px;width:${rect.width}px;height:${rect.height}px;visibility:hidden;pointer-events:none;box-sizing:border-box;`;
+    // Computed SVG styles often explicitly set visibility:visible. Opacity
+    // hides the entire composited subtree, which descendants cannot override.
+    element.style.cssText = `position:absolute;left:${x}px;top:${y}px;width:${rect.width}px;height:${rect.height}px;visibility:hidden;opacity:0;pointer-events:none;box-sizing:border-box;`;
     element.append(visual);
     stage.append(element);
-    const layer: Layer = { id: layers.length, kind, x, y, width: rect.width, height: rect.height, element, parent, signature, done: false, started: false, opacity: visual.style.opacity };
+    const layer: Layer = { id: layers.length, kind, x, y, width: rect.width, height: rect.height, element, parent, signature, done: false, started: false, progress: 0, opacity: visual.style.opacity };
     if (kind === 'box' && signature) {
       layer.master = masters.get(signature);
       if (!layer.master) masters.set(signature, layer);
@@ -59,7 +70,8 @@ export function snapshot(target: HTMLElement, stage: HTMLElement, maxLayers: num
     return layer;
   };
 
-  const walk = (el: Element, parent?: Layer, opacity = 1, clip?: DOMRect) => {
+  function* walk(el: Element, parent?: Layer, opacity = 1, clip?: DOMRect): Generator<void> {
+    yield;
     if (layers.length >= maxLayers || ignoredTags.has(el.tagName.toUpperCase()) || el.hasAttribute('data-swarm-ignore') || el.hasAttribute('data-swarm-overlay')) return;
     const css = getComputedStyle(el);
     if (css.display === 'none' || css.visibility === 'hidden' || css.getPropertyValue('content-visibility') === 'hidden') return;
@@ -123,29 +135,46 @@ export function snapshot(target: HTMLElement, stage: HTMLElement, maxLayers: num
     // Range geometry preserves wrapping, inline links and mixed font styles.
     for (const node of Array.from(el.childNodes)) {
       if (layers.length >= maxLayers) break;
-      if (node.nodeType === Node.ELEMENT_NODE) { walk(node as Element, own, opacity, nextClip()); continue; }
+      if (node.nodeType === Node.ELEMENT_NODE) { yield* walk(node as Element, own, opacity, nextClip()); continue; }
       if (node.nodeType !== Node.TEXT_NODE || !node.textContent?.trim()) continue;
       const range = document.createRange();
       range.selectNodeContents(node);
       const bounds = range.getBoundingClientRect();
       if (!bounds.width || !bounds.height || !visible(bounds, nextClip())) continue;
       const visual = document.createElement('div');
-      const runs: { node: HTMLElement; value: string }[] = [];
+      const runs: TextRun[] = [];
       let lastY = -Infinity, lastX = -Infinity;
       let current: HTMLElement | undefined;
-      // Cap character geometry work on pathological text nodes.
+      // Segment by grapheme so emoji, combining accents and Vietnamese are
+      // never revealed as broken UTF-16 fragments. Cache caret geometry here.
       const raw = node.textContent.slice(0, 12000);
-      for (let index = 0; index < raw.length; index++) {
-        range.setStart(node, index); range.setEnd(node, index + 1);
+      const Segmenter = (Intl as unknown as { Segmenter?: new (locale?: string, options?: { granularity: string }) => { segment(text: string): Iterable<{ segment: string; index: number }> } }).Segmenter;
+      const segments = Segmenter ? new Segmenter(undefined, { granularity: 'grapheme' }).segment(raw) : codePoints(raw);
+      let measured = 0;
+      for (const { segment, index } of segments) {
+        if (measured++ % 24 === 0) yield;
+        range.setStart(node, index); range.setEnd(node, index + segment.length);
         const char = range.getBoundingClientRect();
-        if (!char.width && /\s/.test(raw[index])) continue;
+        if (!char.width && /\s/.test(segment)) {
+          // Keep a wrapped/collapsed space in the text sequence without
+          // moving its caret to the empty Range's (0, 0) rectangle.
+          const run = runs[runs.length - 1], previous = run?.units[run.units.length - 1];
+          if (run && previous) {
+            run.value += segment;
+            run.units.push({ ...previous, end: run.value.length });
+          }
+          continue;
+        }
         if (!current || Math.abs(char.top - lastY) > 2 || char.left < lastX - 2) {
           current = document.createElement('span');
           for (const property of textProps) current.style.setProperty(property, css.getPropertyValue(property));
           current.style.cssText += `;position:absolute;left:${char.left - bounds.left}px;top:${char.top - bounds.top}px;white-space:pre;line-height:${char.height}px;opacity:${opacity};`;
-          visual.append(current); runs.push({ node: current, value: '' });
+          visual.append(current); runs.push({ node: current, value: '', opacity: String(opacity), units: [] });
         }
-        runs[runs.length - 1].value += raw[index];
+        const run = runs[runs.length - 1];
+        run.value += segment;
+        const rtl = css.direction === 'rtl';
+        run.units.push({ end: run.value.length, startX: (rtl ? char.right : char.left) + scrollX, x: (rtl ? char.left : char.right) + scrollX, y: char.top + scrollY, height: char.height });
         lastY = char.top; lastX = char.left;
       }
       const layer = add('text', bounds, visual, own);
@@ -159,8 +188,24 @@ export function snapshot(target: HTMLElement, stage: HTMLElement, maxLayers: num
       if (!clip) return rect;
       return new DOMRect(Math.max(clip.left, rect.left), Math.max(clip.top, rect.top), Math.max(0, Math.min(clip.right, rect.right) - Math.max(clip.left, rect.left)), Math.max(0, Math.min(clip.bottom, rect.bottom) - Math.max(clip.top, rect.top)));
     }
-    if (el.shadowRoot) for (const child of Array.from(el.shadowRoot.children)) walk(child, own, opacity, nextClip());
+    if (el.shadowRoot) for (const child of Array.from(el.shadowRoot.children)) yield* walk(child, own, opacity, nextClip());
   };
-  walk(target, undefined, 1, viewport);
+  yield* walk(target, undefined, 1, viewport);
   return { layers, background };
+}
+
+function* codePoints(text: string) {
+  let index = 0;
+  for (const segment of text) {
+    yield { segment, index };
+    index += segment.length;
+  }
+}
+
+/** Synchronous entry for callers that already own a scheduling budget. */
+export function snapshot(target: HTMLElement, stage: HTMLElement, maxLayers: number, viewport?: DOMRect): Snapshot {
+  const steps = snapshotSteps(target, stage, maxLayers, viewport);
+  let next = steps.next();
+  while (!next.done) next = steps.next();
+  return next.value;
 }

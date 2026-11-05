@@ -1,7 +1,7 @@
 export const PALETTE = ['#f56551', '#8b5cf6', '#25a9ed', '#31bd8c', '#e35b9d', '#e9a52a', '#526cf5', '#19b8bc'];
 export const NAMES = ['Cường', 'Linh', 'Alex', 'Maya', 'Kai', 'An', 'Sam', 'Minh', 'Jules', 'Quinn', 'Rin', 'Noah'];
 export function cursorMarkup(color: string) {
-  return `<svg class="pointer" width="26" height="29" viewBox="0 0 26 29" fill="none"><path d="M3 2.5L7.4 23.5L12.2 16.5L20.8 15.9L3 2.5Z" fill="${color.replace(/[^#\w(),.%\s-]/g, '')}" stroke="white" stroke-width="1.7" stroke-linejoin="round"/></svg><svg class="cross" width="22" height="22" viewBox="0 0 22 22"><path d="M11 1V21M1 11H21" stroke="currentColor" stroke-width="1.5"/></svg><span class="ibeam">I</span><span class="pen">✒</span>`;
+  return `<svg class="pointer" width="26" height="29" viewBox="0 0 26 29" fill="none"><path d="M3 2.5L7.4 23.5L12.2 16.5L20.8 15.9L3 2.5Z" fill="${color.replace(/[^#\w(),.%\s-]/g, '')}" stroke="white" stroke-width="1.7" stroke-linejoin="round"/></svg><svg class="cross" width="22" height="22" viewBox="0 0 22 22"><path d="M11 1V21M1 11H21" stroke="currentColor" stroke-width="1.5"/></svg><svg class="ibeam" width="12" height="24" viewBox="0 0 12 24" preserveAspectRatio="none" aria-hidden="true"><path d="M3 1H9M6 1V23M3 23H9" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><span class="pen">✒</span>`;
 }
 export const styles = `
 :host{all:initial;color-scheme:light;font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#fff}
@@ -15,13 +15,13 @@ export const styles = `
 .worker .cross,.worker .ibeam,.worker .pen{display:none;position:absolute;left:-11px;top:-11px}
 .worker[data-tool=cross] .pointer,.worker[data-tool=type] .pointer,.worker[data-tool=pen] .pointer{display:none}
 .worker[data-tool=cross] .cross,.worker[data-tool=type] .ibeam,.worker[data-tool=pen] .pen{display:block}
-.ibeam{font:24px/1 Georgia,serif;width:22px;text-align:center}.pen{font:23px/1 serif}
+.worker .ibeam{left:-6px;top:0;width:12px;height:var(--caret-height,24px);color:var(--color);filter:drop-shadow(0 0 1px #fff)}.pen{font:23px/1 serif}
 .worker[data-tool=duplicate]::before{content:'⌥';position:absolute;left:-10px;top:-14px;font-size:11px}
 .name{display:block;position:absolute;left:13px;top:19px;background:var(--color);border:1px solid #fff5;border-radius:3px;padding:1px 5px;color:#fff;font-size:10px;white-space:nowrap;opacity:.94}
 .selection{position:absolute;pointer-events:none;border:1px solid var(--color);min-width:1px;min-height:1px}
 .selection::before,.selection::after{content:'';position:absolute;width:5px;height:5px;background:#fff;border:1px solid var(--color)}
 .selection::before{left:-3px;top:-3px}.selection::after{right:-3px;bottom:-3px}
-.badge{position:absolute;top:calc(100% + 7px);left:var(--swarm-center-x,50%);transform:translateX(-50%);font:10px/1.4 ui-monospace,monospace;padding:2px 5px;background:var(--color);color:white;border-radius:2px;white-space:nowrap}
+.badge{position:absolute;top:calc(100% + 7px);left:50%;transform:translateX(-50%);font:10px/1.4 ui-monospace,monospace;padding:2px 5px;background:var(--color);color:white;border-radius:2px;white-space:nowrap}
 .guide{position:fixed;top:var(--swarm-top,20px);height:var(--swarm-height,100vh);border-left:1px solid #f16a56;opacity:.65;pointer-events:none}
 .measure{position:absolute;top:-19px;left:0;right:0;border-bottom:1px solid #f16a56;color:#f16a56;text-align:center;font:10px/1.5 monospace}
 .ruler-x{position:fixed;left:var(--swarm-left,20px);width:var(--swarm-width,100vw);top:var(--swarm-top,0px);height:20px;background:repeating-linear-gradient(90deg,#aaa5 0px,#aaa5 1px,transparent 1px,transparent 10px),#fafafae8;border-bottom:1px solid #ddd8;color:#999;font:9px/18px monospace;pointer-events:none}
