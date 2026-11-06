@@ -249,6 +249,9 @@ Snapshots preserve measured text, common boxes, gradients, controls, images, SVG
 ## 0.3.0
 
 - Fix SVG/media descendants escaping hidden snapshot layers before their own drawing starts.
+- Preserve CSS `rotate`, `scale` and 2D/3D `transform` groups during reconstruction so tilted/scaled elements and their text are drawn and typed in place without snapping at completion.
+- Merge inline formatting flows (`<strong>`, `<em>`, `<a>`, `<br>`, adjacent JSX text nodes), gradient-clipped text (`background-clip: text`), ellipsis clipping and form field values into cohesive typing tasks.
+- Curved cursor flight paths with velocity banking, diagonal 2D surface reveal, human typing cadence, and randomized scatter trajectories on completion.
 - Resize the cursor pool during a run with `setCursorCount` or the React prop.
 - Parallelize work across partially drawn surfaces and stage waiting cursors near upcoming tasks.
 - Stronger, faster floating motion with `floatAmplitude` and `floatSpeed` controls.

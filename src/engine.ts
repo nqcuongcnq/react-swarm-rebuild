@@ -2,16 +2,17 @@ import { SwarmAudio } from './audio';
 import { backgroundColor, visibleBounds } from './bounds';
 import { clamp, finite, stepSpring } from './math';
 import { cursorMarkup, NAMES, PALETTE, styles } from './presentation';
-import { snapshotSteps, type Layer, type Snapshot } from './snapshot';
+import { layerPoint, snapshotSteps, type Layer, type Snapshot } from './snapshot';
 import type { SwarmController, SwarmOptions, SwarmPhase, SwarmState } from './types';
 
 interface Worker {
   node: HTMLDivElement; selection: HTMLDivElement; badge: HTMLSpanElement;
-  index: number; angle: number;
+  index: number; angle: number; scale: number;
   x: number; y: number; vx: number; vy: number;
-  fromX: number; fromY: number; fromVx: number; fromVy: number; elapsed: number; duration: number;
+  fromX: number; fromY: number; fromVx: number; fromVy: number;
+  travel: number; curve: number; elapsed: number; duration: number;
   idleX: number; idleY: number; idleTime: number; delay: number;
-  exitX: number; exitY: number;
+  exitX: number; exitY: number; exitCurveX: number; exitCurveY: number; exitAngle: number;
   task?: Layer; pending?: Layer; color: string; retiring: boolean; bornAt: number;
 }
 const smooth = (t: number) => { const x = clamp(t, 0, 1); return x * x * (3 - 2 * x); };
@@ -250,7 +251,7 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
           stage.append(worker.selection);
           worker.fromX = worker.x; worker.fromY = worker.y;
           worker.idleX = worker.x; worker.idleY = worker.y; worker.idleTime = 0;
-          worker.delay = options.smoothTransition === false ? 0 : worker.index * .025;
+          worker.delay = options.smoothTransition === false ? 0 : worker.index * .022;
         });
         if (options.showGuides === true) {
           const positions = [...new Set(layers.filter(layer => layer.kind === 'text').map(layer => Math.round(layer.x)))].slice(0, 5);
@@ -278,13 +279,16 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
     selection.style.setProperty('--color', color); selection.hidden = true;
     const badge = element('span', 'badge', selection);
     const angle = index / count * Math.PI * 2;
-    const x = bounds.left + bounds.width / 2 + Math.cos(angle) * Math.min(100, bounds.width * .25);
-    const y = bounds.top + bounds.height * .46 + Math.sin(angle) * Math.min(70, bounds.height * .2);
+    const ring = .72 + (index % 3) * .18;
+    const x = bounds.left + bounds.width / 2 + Math.cos(angle) * Math.min(105, bounds.width * .26) * ring;
+    const y = bounds.top + bounds.height * .46 + Math.sin(angle) * Math.min(74, bounds.height * .21) * ring;
     node.style.transform = `translate3d(${x}px,${y}px,0)`;
     node.dataset.motion = 'orbit';
-    return { node, selection, badge, index, color, x, y, angle: 0, vx: 0, vy: 0,
-      fromX: x, fromY: y, fromVx: 0, fromVy: 0, idleX: x, idleY: y, idleTime: 0, delay: 0,
-      exitX: x, exitY: y, elapsed: 0, duration: 1, retiring: false, bornAt: -Infinity };
+    return { node, selection, badge, index, color, x, y, angle: 0, scale: 1, vx: 0, vy: 0,
+      fromX: x, fromY: y, fromVx: 0, fromVy: 0, travel: .36, curve: 0,
+      idleX: x, idleY: y, idleTime: 0, delay: 0,
+      exitX: x, exitY: y, exitCurveX: 0, exitCurveY: 0, exitAngle: 0,
+      elapsed: 0, duration: 1, retiring: false, bornAt: -Infinity };
   }
   function setCursorCount(count: number) {
     if (destroyed) return;
@@ -331,8 +335,9 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
   function dependenciesReady(layer: Layer) {
     if (options.parallelDrawing === false) return (!layer.parent || layer.parent.done) && (!layer.master || layer.master.done);
     // DOM order already fixes visual stacking. Begin details while their
-    // backdrop is drawing rather than serializing every nested surface.
-    return (!layer.parent || layer.parent.done || layer.parent.progress >= .15) &&
+    // backdrop is drawing, or once a duplicated parent has mostly landed.
+    const parentThreshold = layer.parent?.master ? .68 : .15;
+    return (!layer.parent || layer.parent.done || layer.parent.progress >= parentThreshold) &&
       (!layer.master || layer.master.done || layer.master.progress >= .35);
   }
   function choosePending(worker: Worker) {
@@ -346,8 +351,8 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
     let best: Layer | undefined, score = Infinity;
     for (const layer of layers) {
       if (layer.done || layer.started || !dependenciesReady(layer)) continue;
-      if (layer.y > bottom + 80) continue;
-      const priority = Math.max(0, layer.y - top) * .8 + Math.hypot(layer.x - window.scrollX - worker.x, layer.y - top - worker.y) * .2 - (worker.pending === layer ? 150 : 0);
+      if (layer.cy - layer.height * .5 > bottom + 80) continue;
+      const priority = Math.max(0, layer.cy - layer.height * .5 - top) * .78 + Math.hypot(layer.cx - window.scrollX - worker.x, layer.cy - top - worker.y) * .22 - (worker.pending === layer ? 150 : 0);
       if (priority < score) { best = layer; score = priority; }
     }
     if (!best) { choosePending(worker); return; }
@@ -355,12 +360,21 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
     best.started = true; worker.task = best; worker.elapsed = 0;
     worker.fromX = worker.x; worker.fromY = worker.y;
     worker.fromVx = worker.vx; worker.fromVy = worker.vy;
+    const first = best.text?.[0]?.units[0];
+    const startPt = layerPoint(best, first && options.typing !== false ? first.startX : best.master ? best.master.x : best.x, first && options.typing !== false ? first.y : best.master ? best.master.y : best.y);
+    const dist = Math.hypot(startPt.x - window.scrollX - worker.x, startPt.y - window.scrollY - worker.y);
+    worker.travel = clamp(.2 + Math.sqrt(dist) * .013, .2, .52);
+    const sign = (worker.index + best.id) % 2 === 0 ? 1 : -1;
+    worker.curve = sign * clamp(dist * (.11 + ((worker.index + best.id) % 4) * .03), 8, 64);
     const count = best.text?.reduce((sum, run) => sum + run.units.length, 0) ?? 0;
+    const rawTyping = count / finite(options.typingSpeed, 45, 5, 300);
     worker.duration = best.kind === 'text'
-      ? clamp(count / finite(options.typingSpeed, 45, 5, 300), .35, 8)
-      : .5 + Math.min(1, (best.width + best.height) / 1000);
+      ? clamp(rawTyping < 1 ? .48 + rawTyping * .52 : rawTyping, .48, 8)
+      : .45 + Math.min(1, (best.width + best.height) / 950);
     worker.node.dataset.motion = 'working';
     worker.node.dataset.tool = 'arrow';
+    worker.node.style.setProperty('--caret-angle', `${best.container.angle.toFixed(2)}deg`);
+    if (worker.selection.parentElement !== best.container.node) best.container.node.append(worker.selection);
     worker.selection.style.borderStyle = best.master ? 'dashed' : 'solid';
     if (best.master && options.showGuides === true) {
       const measure = element('span', 'measure', worker.selection);
@@ -370,18 +384,28 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
   function work(worker: Worker, dt: number) {
     const task = worker.task!;
     worker.elapsed += dt;
-    const travel = .55;
-    const x = task.x - window.scrollX, y = task.y - window.scrollY;
+    const travel = worker.travel;
     const first = task.text?.[0]?.units[0];
-    const startX = first && options.typing !== false ? first.startX - window.scrollX : task.master ? task.master.x - window.scrollX : x;
-    const startY = first && options.typing !== false ? first.y - window.scrollY : task.master ? task.master.y - window.scrollY : y;
+    const rawStartX = first && options.typing !== false ? first.startX : task.master ? task.master.x : task.x;
+    const rawStartY = first && options.typing !== false ? first.y : task.master ? task.master.y : task.y;
+    const startPt = layerPoint(task, rawStartX, rawStartY);
+    const startX = startPt.x - window.scrollX, startY = startPt.y - window.scrollY;
     if (worker.elapsed < travel) {
       const t = clamp(worker.elapsed / travel, 0, 1), blend = smooth(t);
-      // Hermite travel retains the drift velocity at departure and arrives
-      // at rest, instead of snapping from the orbit to an unrelated easing.
+      const dx = startX - worker.fromX, dy = startY - worker.fromY;
+      const len = Math.hypot(dx, dy) || 1;
+      const nx = -dy / len, ny = dx / len;
+      const arc = 4 * blend * (1 - blend) * worker.curve;
+      // Hermite travel with a lateral Bezier arc retains departure velocity
+      // and curves naturally like a human hand moving across a canvas.
       const tangent = t * (1 - t) * (1 - t) * travel / state.speed;
-      worker.x = worker.fromX + (startX - worker.fromX) * blend + worker.fromVx * tangent;
-      worker.y = worker.fromY + (startY - worker.fromY) * blend + worker.fromVy * tangent;
+      const prevX = worker.x, prevY = worker.y;
+      worker.x = worker.fromX + dx * blend + nx * arc + worker.fromVx * tangent;
+      worker.y = worker.fromY + dy * blend + ny * arc + worker.fromVy * tangent;
+      const stepDt = Math.max(.004, dt / state.speed);
+      const vx = (worker.x - prevX) / stepDt, vy = (worker.y - prevY) / stepDt;
+      const bank = clamp(vx * .026 - vy * .01, -26, 26) * (1 - blend * .65);
+      worker.angle += (bank - worker.angle) * (1 - Math.exp(-14 * stepDt));
       return;
     }
     const t = clamp((worker.elapsed - travel) / worker.duration, 0, 1);
@@ -390,7 +414,7 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
     task.element.dataset.swarmProgress = String(t);
     const width = task.width * draw, height = task.height * draw;
     const duplicateX = task.master ? (task.master.x - task.x) * (1 - draw) : 0;
-    const duplicateY = task.master ? (task.master.y - task.y) * (1 - draw) : 0;
+    const duplicateY = task.master ? (task.master.y - task.y) * (1 - draw) - Math.sin(draw * Math.PI) * 10 : 0;
     task.element.style.opacity = '1';
     task.element.style.visibility = 'visible';
     task.element.style.transform = task.master ? `translate(${duplicateX}px,${duplicateY}px)` : '';
@@ -399,35 +423,57 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
       const typing = options.typing !== false;
       worker.node.dataset.tool = typing ? 'type' : 'arrow';
       const count = task.text.reduce((sum, run) => sum + run.units.length, 0);
-      let remaining = typing ? Math.floor(count * t) : count;
+      // Modulate typing with a gentle human cadence while guaranteeing at
+      // least the first grapheme is visible as soon as the caret arrives.
+      const cadence = clamp(t + Math.sin(t * Math.PI * 3 + worker.index) * (.12 / Math.max(4, count)) * (1 - t), 0, 1);
+      const totalTyped = typing ? (t >= 1 ? count : Math.min(count, Math.max(1, Math.floor(cadence * (count + .7))))) : count;
+      let remaining = totalTyped;
       let caret = first;
       let typed = false;
       for (const run of task.text) {
         const shown = Math.min(run.units.length, Math.max(0, remaining));
         const value = run.value.slice(0, shown ? run.units[shown - 1].end : 0);
+        if (run.write) {
+          if (run.shown !== value) { run.shown = value; run.write(value); typed = true; }
+        }
         if (run.node.textContent !== value) { run.node.textContent = value; typed = true; }
         if (shown) caret = run.units[shown - 1];
         remaining -= run.units.length;
-        run.node.style.opacity = typing ? run.opacity : String(Number(run.opacity || 1) * smooth(t));
+        run.node.style.opacity = typing ? run.opacity : String(Number(run.opacity || 1) * draw);
       }
-      const anyTyped = !typing || Math.floor(count * t) > 0;
-      worker.x = caret ? (anyTyped ? caret.x : caret.startX) - window.scrollX : x;
-      worker.y = caret ? caret.y - window.scrollY : y;
+      const anyTyped = !typing || totalTyped > 0;
+      const rawX = caret ? (anyTyped ? caret.x : caret.startX) : task.x;
+      const rawY = caret ? caret.y : task.y;
+      const pt = layerPoint(task, rawX, rawY);
+      worker.x = pt.x - window.scrollX;
+      worker.y = pt.y - window.scrollY;
       worker.node.style.setProperty('--caret-height', `${clamp(caret?.height ?? task.height, 12, 80)}px`);
+      worker.node.style.setProperty('--caret-angle', `${task.container.angle.toFixed(2)}deg`);
       if (typing && typed) audio.play('type', worker.x / viewportWidth);
     } else {
       worker.node.dataset.tool = task.master ? 'duplicate' : task.kind === 'line' ? 'pen' : 'cross';
       worker.selection.hidden = false;
-      worker.selection.style.left = `${task.x + duplicateX}px`; worker.selection.style.top = `${task.y + duplicateY}px`;
+      const localLeft = task.x - task.container.ox + duplicateX;
+      const localTop = task.y - task.container.oy + duplicateY;
+      worker.selection.style.left = `${localLeft}px`; worker.selection.style.top = `${localTop}px`;
       worker.selection.style.width = `${Math.max(1, task.master ? task.width : width)}px`;
       worker.selection.style.height = `${Math.max(1, task.master ? task.height : height)}px`;
       worker.selection.style.background = task.kind === 'box' && !task.master && t < .65 ? '#a0a5ab18' : '';
       worker.badge.textContent = `${Math.round(width)} × ${Math.round(height)}`;
-      worker.x = task.master ? x + duplicateX : x + width;
-      worker.y = task.master ? y + duplicateY : y + height;
+      const localX = task.master ? task.x + duplicateX : task.kind === 'line' && task.height > task.width ? task.x + task.width * .5 : task.x + width;
+      const localY = task.master ? task.y + duplicateY : task.kind === 'line' && task.width >= task.height ? task.y + task.height * .5 : task.y + height;
+      const pt = layerPoint(task, localX, localY);
+      worker.x = pt.x - window.scrollX;
+      worker.y = pt.y - window.scrollY;
       const visual = task.element.firstElementChild as HTMLElement;
-      visual.style.clipPath = task.master ? '' : task.kind === 'media' ? `inset(0 0 ${100 - draw * 100}% 0)` : `inset(0 ${100 - draw * 100}% 0 0)`;
-      visual.style.opacity = String(Number(task.opacity || 1) * (.3 + .7 * draw));
+      const clipRight = (1 - draw) * 100, clipBottom = (1 - draw) * 100;
+      visual.style.clipPath = task.master || draw > .97
+        ? ''
+        : task.kind === 'line'
+          ? (task.height > task.width ? `inset(0 0 ${clipBottom}% 0)` : `inset(0 ${clipRight}% 0 0)`)
+          : `inset(0 ${clipRight}% ${clipBottom}% 0)`;
+      visual.style.transform = task.master || task.kind === 'line' ? '' : `scale(${(.975 + .025 * draw).toFixed(4)})`;
+      visual.style.opacity = String(Number(task.opacity || 1) * (.28 + .72 * draw));
     }
     if (t > .02 && t < .08) audio.play('draw', worker.x / viewportWidth);
     if (t >= 1) {
@@ -437,9 +483,10 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
       task.element.style.transform = '';
       worker.selection.hidden = true; worker.selection.querySelector('.measure')?.remove();
       worker.node.dataset.tool = 'arrow'; worker.node.dataset.motion = 'idle';
+      worker.node.style.setProperty('--caret-angle', '0deg');
       worker.task = undefined; worker.vx = 0; worker.vy = 0;
       worker.idleX = worker.x; worker.idleY = worker.y; worker.idleTime = 0;
-      worker.delay = options.smoothTransition === false ? 0 : .08 + (worker.index % 5) * .025;
+      worker.delay = options.smoothTransition === false ? 0 : .06 + (worker.index % 5) * .022;
       state.completed++; state.progress = state.total ? state.completed / state.total : 1;
     }
   }
@@ -450,29 +497,31 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
     let tx: number, ty: number;
     if (orbit) {
       const buoyant = options.floatingIntro !== false;
-      const theta = worker.index / workers.length * Math.PI * 2 + time * .8;
-      const breathe = buoyant ? Math.sin(time * 1.45 + phase) * 24 * amplitude : 0;
-      const radius = Math.min(105 + breathe, bounds.width * .31, bounds.height * .31);
-      tx = bounds.left + bounds.width / 2 + Math.cos(theta) * radius + (buoyant ? Math.sin(time * 1.35 + phase) * 18 * amplitude : 0);
-      ty = bounds.top + bounds.height * .46 + Math.sin(theta) * radius * .7 + (buoyant ? Math.sin(time * 1.9 + phase) * 26 * amplitude : 0);
+      const ring = buoyant ? .74 + (worker.index % 3) * .17 : 1;
+      const direction = buoyant && worker.index % 4 === 3 ? -.72 : .85;
+      const theta = worker.index / workers.length * Math.PI * 2 + time * direction;
+      const breathe = buoyant ? Math.sin(time * 1.45 + phase) * 26 * amplitude : 0;
+      const radius = Math.min((108 + breathe) * ring, bounds.width * .32, bounds.height * .32);
+      tx = bounds.left + bounds.width / 2 + Math.cos(theta) * radius + (buoyant ? Math.sin(time * 1.65 + phase) * 20 * amplitude : 0);
+      ty = bounds.top + bounds.height * .46 + Math.sin(theta) * radius * .72 + (buoyant ? Math.cos(time * 2.05 + phase) * 24 * amplitude : 0);
     } else if (options.floatingIdle !== false) {
       worker.idleTime += dt;
-      const settle = smooth(worker.idleTime / .35);
+      const settle = smooth(worker.idleTime / .32);
       if (worker.pending && !worker.pending.started && !worker.pending.done) {
-        const nextX = clamp(worker.pending.x - window.scrollX + worker.pending.width * .5, bounds.left + 25, Math.max(bounds.left + 25, bounds.right - 35));
-        const nextY = clamp(worker.pending.y - window.scrollY + Math.min(worker.pending.height * .5, 80), bounds.top + 35, Math.max(bounds.top + 35, bounds.bottom - 45));
-        const reposition = 1 - Math.exp(-2.8 * dt);
+        const nextX = clamp(worker.pending.cx - window.scrollX, bounds.left + 25, Math.max(bounds.left + 25, bounds.right - 35));
+        const nextY = clamp(worker.pending.cy - window.scrollY, bounds.top + 35, Math.max(bounds.top + 35, bounds.bottom - 45));
+        const reposition = 1 - Math.exp(-3.1 * dt);
         worker.idleX += (nextX - worker.idleX) * reposition;
         worker.idleY += (nextY - worker.idleY) * reposition;
       }
-      tx = worker.idleX + (Math.sin(time * 1.5 + phase) * 55 + Math.sin(time * 2.3 + phase * .7) * 14) * amplitude * settle;
-      ty = worker.idleY + (Math.cos(time * 1.85 + phase) * 38 + Math.sin(time * 2.7 + phase * 1.3) * 10) * amplitude * settle;
+      tx = worker.idleX + (Math.sin(time * 1.55 + phase) * 52 + Math.sin(time * 2.4 + phase * .7) * 16) * amplitude * settle;
+      ty = worker.idleY + (Math.cos(time * 1.85 + phase) * 36 + Math.sin(time * 2.75 + phase * 1.3) * 12) * amplitude * settle;
     } else {
       const theta = worker.index / workers.length * Math.PI * 2 + time * .28;
       const radius = 55 + (worker.index % 4) * 23;
       tx = pointer.x + Math.cos(theta) * radius; ty = pointer.y + Math.sin(theta) * radius * .7;
     }
-    // The waiting motion has more energy but remains damped and continuous.
+    // The waiting motion has energy and banks into turns while staying damped.
     const respond = (position: number, velocity: number, destination: number) => {
       const nextVelocity = (velocity + (destination - position) * 38 * dt) * Math.exp(-8 * dt);
       return { position: position + nextVelocity * dt, velocity: nextVelocity };
@@ -481,20 +530,33 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
     const sy = respond(worker.y, worker.vy, clamp(ty, bounds.top + 25, Math.max(bounds.top + 25, bounds.bottom - 35)));
     worker.x = sx.position; worker.vx = sx.velocity; worker.y = sy.position; worker.vy = sy.velocity;
     worker.node.dataset.motion = orbit ? 'orbit' : worker.pending && !worker.pending.started ? 'staging' : 'idle';
-    const tilt = Math.sin(time * 1.5 + phase) * 23;
-    worker.angle += (tilt - worker.angle) * (1 - Math.exp(-7 * dt));
+    const bank = clamp(worker.vx * .045 - worker.vy * .015, -24, 24);
+    const tilt = Math.sin(time * 1.5 + phase) * 16 + bank;
+    worker.angle += (tilt - worker.angle) * (1 - Math.exp(-8 * dt));
   }
   function beginExit() {
     if (options.burstOnComplete === false || finite(options.exitDuration, 700, 0, 3000) === 0) { goLive(); return; }
-    const centerX = bounds.left + bounds.width / 2, centerY = bounds.top + bounds.height / 2;
-    const ordered = [...workers].sort((a, b) => Math.atan2(a.y - centerY, a.x - centerX) - Math.atan2(b.y - centerY, b.x - centerX));
-    const distance = Math.hypot(bounds.width, bounds.height) + 100;
-    ordered.forEach((worker, index) => {
-      // Spread directions evenly without collecting cursors at the center.
-      const angle = -Math.PI + (index + .5) / workers.length * Math.PI * 2;
+    const baseDistance = Math.hypot(bounds.width, bounds.height) + 120;
+    // Shuffle sector indices so cursors scatter in random, uncorrelated
+    // directions from their current spots rather than a uniform wheel.
+    const indices = workers.map((_, i) => i);
+    for (let i = indices.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [indices[i], indices[j]] = [indices[j], indices[i]];
+    }
+    workers.forEach((worker, i) => {
+      const sector = indices[i] / Math.max(1, workers.length);
+      const jitter = (Math.random() - .5) * (Math.PI * 1.35 / Math.max(1, workers.length) + .85);
+      const angle = -Math.PI + sector * Math.PI * 2 + jitter;
+      const distance = baseDistance * (.78 + Math.random() * .62);
+      const dx = Math.cos(angle) * distance, dy = Math.sin(angle) * distance;
+      const curve = (Math.random() - .5) * 220;
       worker.fromX = worker.x; worker.fromY = worker.y;
-      worker.exitX = worker.x + Math.cos(angle) * distance;
-      worker.exitY = worker.y + Math.sin(angle) * distance;
+      worker.exitX = worker.x + dx;
+      worker.exitY = worker.y + dy;
+      worker.exitCurveX = -Math.sin(angle) * curve;
+      worker.exitCurveY = Math.cos(angle) * curve;
+      worker.exitAngle = clamp(Math.cos(angle) * 28 - Math.sin(angle) * 14 + (Math.random() - .5) * 18, -42, 42);
       worker.node.dataset.tool = 'arrow'; worker.node.dataset.motion = 'exit';
       worker.selection.hidden = true;
     });
@@ -504,7 +566,7 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
     if (state.phase !== 'exiting' && Number.isFinite(worker.bornAt)) worker.node.style.opacity = String(smooth((motionTime - worker.bornAt) / .25));
     worker.node.style.transform = `translate3d(${worker.x.toFixed(2)}px,${worker.y.toFixed(2)}px,0)`;
     const arrow = worker.node.querySelector<SVGElement>('.pointer');
-    if (arrow) arrow.style.transform = `translate(-3px,-2.5px) rotate(${worker.angle.toFixed(2)}deg)`;
+    if (arrow) arrow.style.transform = `translate(-3px,-2.5px) rotate(${worker.angle.toFixed(2)}deg) scale(${worker.scale.toFixed(3)})`;
   }
   function tick(now: number) {
     if (!active) return;
@@ -525,6 +587,8 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
       if (bar) bar.style.opacity = String(entrance);
       if (state.phase === 'intro') {
         intro.style.opacity = String(entrance);
+        const pulse = 1 + Math.sin(motionTime * 3.2) * .045;
+        intro.style.transform = `translate(-50%,-50%) scale(${pulse.toFixed(3)})`;
         workers.forEach(worker => float(worker, realDt, true));
         if (ready && elapsed * 1000 >= finite(options.introDuration, 1600, 0, 15000)) prepareSnapshot();
         if (!active) return;
@@ -532,12 +596,13 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
         transitionTime += realDt;
         const t = smooth(transitionTime * 1000 / Math.max(1, finite(options.transitionDuration, 480, 0, 3000)));
         intro.style.opacity = String(1 - t);
+        intro.style.transform = `translate(-50%,-50%) scale(${(1 - t * .18).toFixed(3)})`;
         workers.forEach(worker => {
           // Brake the existing orbit with the same spring, keeping velocity
           // continuous while workers settle into independent waiting spots.
           const phase = worker.index * 2.399963;
-          const sx = stepSpring(worker.x, worker.vx, worker.fromX + Math.sin(phase) * 18 * t, realDt);
-          const sy = stepSpring(worker.y, worker.vy, worker.fromY + Math.cos(phase) * 14 * t, realDt);
+          const sx = stepSpring(worker.x, worker.vx, worker.fromX + Math.sin(phase) * 22 * t, realDt);
+          const sy = stepSpring(worker.y, worker.vy, worker.fromY + Math.cos(phase) * 16 * t, realDt);
           worker.x = sx.position; worker.vx = sx.velocity;
           worker.y = sy.position; worker.vy = sy.velocity;
           worker.node.dataset.motion = 'handoff';
@@ -551,13 +616,13 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
           if (worker.retiring && !worker.task) return;
           if (!worker.retiring && !worker.task && worker.delay <= 0) assign(worker);
           if (worker.task) {
-            worker.angle *= Math.exp(-8 * realDt);
+            if (worker.elapsed >= worker.travel) worker.angle *= Math.exp(-10 * realDt);
             work(worker, dt);
           } else float(worker, realDt, false);
         });
         retireWorkers();
         if (state.tour && !scoped) {
-          const next = layers.filter(layer => !layer.done).reduce((min, layer) => Math.min(min, layer.y), Infinity);
+          const next = layers.filter(layer => !layer.done).reduce((min, layer) => Math.min(min, layer.cy - layer.height * .5), Infinity);
           if (Number.isFinite(next)) {
             const goal = Math.max(0, next - viewportHeight * .35);
             if (goal > window.scrollY + 1) window.scrollBy(0, Math.min(goal - window.scrollY, 180 * dt));
@@ -573,13 +638,16 @@ export function createSwarmRebuild(options: SwarmOptions = {}): SwarmController 
       } else if (state.phase === 'exiting') {
         exitTime += realDt;
         const t = clamp(exitTime * 1000 / Math.max(1, finite(options.exitDuration, 700, 0, 3000)), 0, 1);
-        const accelerate = t * t;
+        const progress = t * (.36 + .64 * t);
+        const arc = 4 * t * (1 - t);
         workers.forEach(worker => {
-          worker.x = worker.fromX + (worker.exitX - worker.fromX) * accelerate;
-          worker.y = worker.fromY + (worker.exitY - worker.fromY) * accelerate;
-          worker.node.style.opacity = String(1 - smooth((t - .45) / .55));
+          worker.x = worker.fromX + (worker.exitX - worker.fromX) * progress + worker.exitCurveX * arc;
+          worker.y = worker.fromY + (worker.exitY - worker.fromY) * progress + worker.exitCurveY * arc;
+          worker.angle += (worker.exitAngle - worker.angle) * (1 - Math.exp(-12 * realDt));
+          worker.scale = 1 - smooth(t) * .12;
+          worker.node.style.opacity = String(1 - smooth((t - .42) / .58));
         });
-        cover.style.opacity = String(1 - smooth((t - .45) / .55));
+        cover.style.opacity = String(1 - smooth((t - .42) / .58));
         if (bar) bar.style.opacity = String(1 - smooth(t));
         if (t >= 1) { goLive(); return; }
       } else if (state.phase === 'complete') {
