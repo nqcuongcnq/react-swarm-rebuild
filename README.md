@@ -232,43 +232,6 @@ State fields: `phase`, `progress`, `completed`, `total`, `agents`, `speed`, `sou
 
 Watch `phase === 'live'` to know that the automatic exit has finished and the overlay is gone. A skipped run does not call `onComplete()`. `pause()` freezes the animation, including a handoff or exit; `resume()` continues it.
 
-## Install and develop
-
-```sh
-npm install react-swarm-rebuild
-# Or install the local release:
-npm install /path/to/react-swarm-rebuild-0.3.0.tgz
-
-npm install
-npm run typecheck
-npm run build
-npm run test:browser  # Chrome required; set CHROME_PATH if needed.
-npm pack
-```
-
-Use Node 20+ for development with current Playwright versions. The bundled library supports Node 18+ for server imports and needs no CSS import or runtime dependency beyond its React peers. It is safe to import/render on the server. Browsers need Shadow DOM, DOM Range, requestAnimationFrame and CSS clip-path.
-
-Snapshots preserve measured text, common boxes, gradients, controls, images, SVGs and readable 2D canvases. They are visual reconstructions rather than screenshots: complex transforms, pseudo-elements, custom elements, protected canvases, cross-origin iframes and unavailable media may differ. Lazy content must already be loaded. Geometry is measured across frames while the real application continues running; settle dynamic data/fonts before releasing `ready`. Add `data-swarm-ignore` to exclude a subtree.
-
-## Publish to npm
-
-Use the Node version selected by `.nvmrc` when publishing. Run these commands from this repository:
-
-```sh
-nvm use
-node --version
-npm --version
-npm login --auth-type=web --registry=https://registry.npmjs.org/
-npm whoami --registry=https://registry.npmjs.org/
-npm publish --access public --registry=https://registry.npmjs.org/
-```
-
-Complete the browser login and any two-factor authentication prompts. Continue to publish only after `npm whoami` returns your npm username. If Node 24 is not installed, run `nvm install` first.
-
-If publication reports `E404` even though packaging succeeded, check authentication with `npm whoami`. An `E401` response means the current credentials are not accepted; log in again with the current CLI. Update an outdated CLI and renew the login before retrying. A failed upload alone does not require a new package version or name.
-
-Publishing requires account 2FA or a granular token with the appropriate publishing permissions and bypass-2FA setting. See the [npm publishing authentication requirements](https://docs.npmjs.com/requiring-2fa-for-package-publishing-and-settings-modification/). Never put tokens in this repository or paste them into chat.
-
 ## 0.3.0
 
 - Fix SVG/media descendants escaping hidden snapshot layers before their own drawing starts.
