@@ -2,6 +2,10 @@
 
 A swarm of colorful cursors reconstructs your React UI. React 18 / 19, TypeScript, ESM and CommonJS. MIT, Nguyễn Quốc Cường.
 
+![React Swarm Rebuild — animated reconstruction demo](https://raw.githubusercontent.com/nqcuongcnq/react-swarm-rebuild/master/assets/demo.gif)
+
+[Source code](https://github.com/nqcuongcnq/react-swarm-rebuild) · [npm](https://www.npmjs.com/package/react-swarm-rebuild) · [Report an issue](https://github.com/nqcuongcnq/react-swarm-rebuild/issues)
+
 ## Quick start
 
 ```tsx
